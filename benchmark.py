@@ -1,22 +1,21 @@
 import pandas as pd
 import numpy as np
-import csv
 from tqdm import tqdm
 from datetime import timedelta
-import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # ---------- Input Data ----------
-# iso_name = "caiso"
+iso_name = "caiso"
 
-# file_paths = [
-#     "data/caiso_2023/caiso_lmp_rt_15min_zones_2023Q1.csv",
-#     "data/caiso_2023/caiso_lmp_rt_15min_zones_2023Q2.csv",
-#     "data/caiso_2023/caiso_lmp_rt_15min_zones_2023Q3.csv",
-#     "data/caiso_2023/caiso_lmp_rt_15min_zones_2023Q4.csv"
-# ]
+file_paths = [
+    "data/caiso_2024/caiso_lmp_rt_15min_zones_2024Q1.csv",
+    "data/caiso_2024/caiso_lmp_rt_15min_zones_2024Q2.csv",
+    "data/caiso_2024/caiso_lmp_rt_15min_zones_2024Q3.csv",
+    "data/caiso_2024/caiso_lmp_rt_15min_zones_2024Q4.csv"
+]
 
-# output_path = "output/caiso_benchmark_2023_hourly_fixedH.xlsx"
-# combined_8760_path = "data/caiso_2023/caiso_2023_hourly_interp.xlsx"
+output_path = "output/caiso_benchmark_2024_hourly_fixedH.xlsx"
+combined_8760_path = "data/caiso_2024/caiso_2024_hourly_interp.xlsx"
 
 # iso_name = "ercot"
 
@@ -30,17 +29,17 @@ import os
 # output_path = "output/ercot_benchmark_2024_hourly_fixedH.xlsx"
 # combined_8760_path = "data/ercot_2024/ercot_2024_hourly_interp.xlsx"
 
-iso_name = "miso"
+# iso_name = "miso"
 
-file_paths = [
-    "data/miso_2024/miso_lmp_rt_5min_hubs_2024Q1.csv",
-    "data/miso_2024/miso_lmp_rt_5min_hubs_2024Q2.csv",
-    "data/miso_2024/miso_lmp_rt_5min_hubs_2024Q3.csv",
-    "data/miso_2024/miso_lmp_rt_5min_hubs_2024Q4.csv"
-]
+# file_paths = [
+#     "data/miso_2024/miso_lmp_rt_5min_hubs_2024Q1.csv",
+#     "data/miso_2024/miso_lmp_rt_5min_hubs_2024Q2.csv",
+#     "data/miso_2024/miso_lmp_rt_5min_hubs_2024Q3.csv",
+#     "data/miso_2024/miso_lmp_rt_5min_hubs_2024Q4.csv"
+# ]
 
-output_path = "output/miso_benchmark_2024_hourly_fixedH.xlsx"
-combined_8760_path = "data/miso_2024/miso_2024_hourly_interp.xlsx"
+# output_path = "output/miso_benchmark_2024_hourly_fixedH.xlsx"
+# combined_8760_path = "data/miso_2024/miso_2024_hourly_interp.xlsx"
 
 # ---------- Input System Params ----------
 MW_charge = 30
@@ -152,6 +151,70 @@ def interpolate_and_pad_to_8760(df_15min, freq="H", start_date=None, end_date=No
     return hourly_df_interp
 
 # ---------- Step 3: Fixed-H Benchmark ----------
+def benchmark_zone(zone, zone_prices, all_days, MW_charge, MW_discharge, t_charge_hrs, t_discharge_hrs):
+    best_H = None
+    best_total_revenue = -np.inf
+    best_H_results = None
+
+    for H in range(24):
+        results = []
+        for day in all_days:
+            block_start = day + timedelta(hours=H)
+            block_end = block_start + timedelta(hours=24)
+            block = zone_prices[block_start:block_end]
+            if len(block) < 24:
+                continue
+
+            best_revenue = -np.inf
+            best_block = None
+            for t_c in range(0, 11):
+                t_charge_end = t_c + t_charge_hrs
+                for t_d in range(t_charge_end, 24 - t_discharge_hrs + 1):
+                    t_discharge_end = t_d + t_discharge_hrs
+                    charge_prices = block.iloc[t_c:t_charge_end].values
+                    discharge_prices = block.iloc[t_d:t_discharge_end].values
+
+                    cost = MW_charge * np.sum(charge_prices)
+                    revenue = MW_discharge * np.sum(discharge_prices)
+                    net = revenue - cost
+
+                    if net > best_revenue:
+                        best_block = {
+                            "date": day.date(),
+                            "block_start": block.index[0],
+                            "charge_start": block.index[t_c],
+                            "charge_end": block.index[t_charge_end - 1],
+                            "discharge_start": block.index[t_d],
+                            "discharge_end": block.index[t_discharge_end - 1],
+                            "avg_charge_price": np.mean(charge_prices),
+                            "charge_cost": cost,
+                            "avg_discharge_price": np.mean(discharge_prices),
+                            "discharge_revenue": revenue,
+                            "revenue": net
+                        }
+                        best_revenue = net
+
+            if best_block:
+                results.append(best_block)
+
+        df_H = pd.DataFrame(results)
+        if df_H.empty:
+            continue
+        total_revenue = df_H["revenue"].sum()
+        if total_revenue > best_total_revenue:
+            best_total_revenue = total_revenue
+            best_H = H
+            best_H_results = df_H
+
+    if best_H_results is not None:
+        summary_df = pd.DataFrame({
+            "Metric": ["Best block offset (H)", "Annual revenue"],
+            "Value": [best_H, best_total_revenue]
+        })
+        return zone, (best_H_results, summary_df)
+    else:
+        return zone, None
+
 def run_fixed_H_arbitrage_benchmark(df_hourly, MW_charge, MW_discharge, t_charge_hrs, t_discharge_hrs, start_date=None, end_date=None):
     if start_date is None:
         start_date = df_hourly.index.min().normalize()
@@ -159,71 +222,28 @@ def run_fixed_H_arbitrage_benchmark(df_hourly, MW_charge, MW_discharge, t_charge
         end_date = df_hourly.index.max().normalize()
     all_days = pd.date_range(start_date, end_date, freq="D")
 
-    final_results = {}
     zones = [col for col in df_hourly.columns if not col.endswith("_is_interpolated")]
 
-    for zone in zones:
-        zone_prices = df_hourly[zone]
-        best_H = None
-        best_total_revenue = -np.inf
-        best_H_results = None
+    print(f"🧠 Parallelizing across {len(zones)} zones...")
+    final_results = {}
+    with ProcessPoolExecutor() as executor:
+        futures = {
+            executor.submit(
+                benchmark_zone,
+                zone,
+                df_hourly[zone],
+                all_days,
+                MW_charge,
+                MW_discharge,
+                t_charge_hrs,
+                t_discharge_hrs
+            ): zone for zone in zones
+        }
 
-        for H in tqdm(range(24), desc=f"Evaluating benchmark for {zone}"):
-            results = []
-            for day in all_days:
-                block_start = day + timedelta(hours=H)
-                block_end = block_start + timedelta(hours=24)
-                block = zone_prices[block_start:block_end]
-                if len(block) < 24:
-                    continue
-
-                best_revenue = -np.inf
-                best_block = None
-                for t_c in range(0, 11):
-                    t_charge_end = t_c + t_charge_hrs
-                    for t_d in range(t_charge_end, 24 - t_discharge_hrs + 1):
-                        t_discharge_end = t_d + t_discharge_hrs
-                        charge_prices = block.iloc[t_c:t_charge_end].values
-                        discharge_prices = block.iloc[t_d:t_discharge_end].values
-
-                        cost = MW_charge * np.sum(charge_prices)
-                        revenue = MW_discharge * np.sum(discharge_prices)
-                        net = revenue - cost
-
-                        if net > best_revenue:
-                            best_block = {
-                                "date": day.date(),
-                                "block_start": block.index[0],
-                                "charge_start": block.index[t_c],
-                                "charge_end": block.index[t_charge_end - 1],
-                                "discharge_start": block.index[t_d],
-                                "discharge_end": block.index[t_discharge_end - 1],
-                                "avg_charge_price": np.mean(charge_prices),
-                                "charge_cost": cost,
-                                "avg_discharge_price": np.mean(discharge_prices),
-                                "discharge_revenue": revenue,
-                                "revenue": net
-                            }
-                            best_revenue = net
-
-                if best_block:
-                    results.append(best_block)
-
-            df_H = pd.DataFrame(results)
-            if df_H.empty:
-                continue
-            total_revenue = df_H["revenue"].sum()
-            if total_revenue > best_total_revenue:
-                best_total_revenue = total_revenue
-                best_H = H
-                best_H_results = df_H
-
-        if best_H_results is not None:
-            summary_df = pd.DataFrame({
-                "Metric": ["Best block offset (H)", "Annual revenue"],
-                "Value": [best_H, best_total_revenue]
-            })
-            final_results[zone] = (best_H_results, summary_df)
+        for f in tqdm(as_completed(futures), total=len(futures), desc="Benchmarking zones"):
+            zone, result = f.result()
+            if result is not None:
+                final_results[zone] = result
 
     return final_results
 
@@ -241,7 +261,7 @@ if __name__ == "__main__":
     
     # Save the combined hourly (8760 or 8784) data.
     df_hourly.to_excel(combined_8760_path)
-    print(f"✅ Combined hourly data saved to: {combined_8760_path}")
+    print(f"Combined hourly data saved to: {combined_8760_path}")
     
     # Run the fixed-H arbitrage benchmark.
     results = run_fixed_H_arbitrage_benchmark(
@@ -255,11 +275,13 @@ if __name__ == "__main__":
     )
 
     # Write benchmark results to Excel.
-    with pd.ExcelWriter(output_path) as writer:
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
         for zone, (df, summary_df) in results.items():
             df.to_excel(writer, sheet_name=zone, index=False)
-            # for cell in ["A{}".format(len(df) + 3), "B{}".format(len(df) + 3), "A{}".format(len(df) + 4), "B{}".format(len(df) + 4)]:
-            #     writer.sheets[zone].cell(cell).style = 'Input'
-            summary_df.to_excel(writer, sheet_name=zone, index=False, startrow=len(df) + 2)
+            for i, (metric, value) in enumerate(zip(summary_df['Metric'], summary_df['Value'])):
+                cell_row = 0 + i
+                cell_col = len(df.columns) + 2  # 1 space after last column
+                writer.sheets[zone].cell(row=cell_row+1, column=cell_col+1, value=metric)
+                writer.sheets[zone].cell(row=cell_row+1, column=cell_col+2, value=value)
 
-    print(f"\n✅ Benchmark complete. Output saved to:\n{output_path}")
+    print(f"\nBenchmark complete. Output saved to:\n{output_path}")
