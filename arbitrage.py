@@ -8,7 +8,8 @@ from arbitrage_types import PricingDataset, ArbitrageStrategy, ChargeDischargeAc
 
 def evaluate_arbitrage(prices: PricingDataset, strategy: ArbitrageStrategy, 
                      max_charge_mw: float, max_discharge_mw: float,
-                     storage_capacity_mwh: float, rte: float) -> Dict:
+                     storage_capacity_mwh: float, rte: float, 
+                     charge_efficiency: float = None, discharge_efficiency: float = None) -> Dict:
     """
     Evaluate an arbitrage strategy against actual prices and system constraints.
     
@@ -19,32 +20,68 @@ def evaluate_arbitrage(prices: PricingDataset, strategy: ArbitrageStrategy,
         max_discharge_mw: Maximum discharging power in MW
         storage_capacity_mwh: Storage capacity in MWh
         rte: Round-trip efficiency (0-1)
+        charge_efficiency: Optional charging efficiency (0-1)
+        discharge_efficiency: Optional discharging efficiency (0-1)
         
     Returns:
         Dictionary with evaluation results including:
-        - total_revenue: Net revenue from the strategy
+        - total_profit: Net profit from the strategy
         - total_cost: Total cost of charging
-        - total_income: Total income from discharging
+        - total_revenue: Total revenue from discharging
         - is_feasible: Whether the strategy is feasible given constraints
         - soc_profile: State of charge profile over time
         - actions: List of actions with financial details
+        - validation_error: Details about validation failure if not feasible
     """
+    # If separate efficiencies aren't provided, derive them from RTE
+    if charge_efficiency is None or discharge_efficiency is None:
+        # Default to equal distribution of losses if not specified
+        charge_efficiency = np.sqrt(rte)
+        discharge_efficiency = np.sqrt(rte)
+    
     # First validate the strategy against system constraints
-    is_feasible = strategy.validate(
+    validation_result = strategy.validate(
         max_charge_mw=max_charge_mw,
         max_discharge_mw=max_discharge_mw,
         storage_capacity_mwh=storage_capacity_mwh,
-        rte=rte
+        rte=charge_efficiency * discharge_efficiency,  # Compute effective RTE
+        charge_efficiency=charge_efficiency,
+        discharge_efficiency=discharge_efficiency
     )
     
-    if not is_feasible:
+    # Check if validation failed and return error details
+    if validation_result is not True:
+        print(f"Strategy validation failed: {validation_result['error']}")
+        
+        # For overlapping actions, show both actions and their overlap period
+        if 'action1' in validation_result and 'action2' in validation_result:
+            action1 = validation_result['action1']
+            action2 = validation_result['action2']
+            print(f"Action 1: {'Charge' if action1.is_charge else 'Discharge'} from {action1.start_time} to {action1.end_time} at {action1.power_mw} MW")
+            print(f"Action 2: {'Charge' if action2.is_charge else 'Discharge'} from {action2.start_time} to {action2.end_time} at {action2.power_mw} MW")
+            overlap_start = max(action1.start_time, action2.start_time)
+            overlap_end = min(action1.end_time, action2.end_time)
+            overlap_duration = (overlap_end - overlap_start).total_seconds() / 3600
+            print(f"Overlap period: {overlap_start} to {overlap_end} ({overlap_duration:.2f} hours)")
+        
+        # For other types of errors
+        elif 'action' in validation_result:
+            action = validation_result['action']
+            print(f"Problematic action: {'Charge' if action.is_charge else 'Discharge'} from {action.start_time} to {action.end_time} at {action.power_mw} MW")
+        
+        if 'deficit' in validation_result:
+            print(f"Energy deficit: {validation_result['deficit']:.2f} MWh")
+        elif 'overflow' in validation_result:
+            print(f"Energy overflow: {validation_result['overflow']:.2f} MWh")
+        
         return {
-            "total_revenue": 0.0,
+            "total_profit": 0.0,
             "total_cost": 0.0,
-            "total_income": 0.0,
+            "total_revenue": 0.0,
             "is_feasible": False,
             "soc_profile": pd.Series(),
-            "actions": []
+            "actions": [],
+            "validation_error": validation_result
         }
     
     # Sort actions by start time
@@ -52,10 +89,8 @@ def evaluate_arbitrage(prices: PricingDataset, strategy: ArbitrageStrategy,
     
     # Initialize tracking variables
     total_cost = 0.0
-    total_income = 0.0
+    total_revenue = 0.0
     soc_mwh = 0.0
-    charge_efficiency = np.sqrt(rte)
-    discharge_efficiency = np.sqrt(rte)
     
     # Track SOC over time
     soc_profile = []
@@ -76,7 +111,28 @@ def evaluate_arbitrage(prices: PricingDataset, strategy: ArbitrageStrategy,
         if action.is_charge:
             # Charging: we pay for energy
             energy_in = action.power_mw * duration_hours * charge_efficiency
-            cost = action.power_mw * sum(action_prices)
+            
+            # Calculate cost based on exact time spent in each hour
+            cost = 0
+            start_time = action.start_time
+            end_time = action.end_time
+            
+            # Iterate through each hour in the price series
+            for i, price in enumerate(action_prices):
+                hour_start = action_prices.index[i]
+                hour_end = hour_start + timedelta(hours=1)
+                
+                # Calculate overlap with this hour
+                overlap_start = max(start_time, hour_start)
+                overlap_end = min(end_time, hour_end)
+                
+                if overlap_end > overlap_start:
+                    # Calculate fraction of hour used
+                    fraction = (overlap_end - overlap_start).total_seconds() / 3600
+                    # Calculate cost for this hour
+                    hour_cost = action.power_mw * fraction * price
+                    cost += hour_cost
+            
             total_cost += cost
             soc_mwh += energy_in
             
@@ -92,9 +148,32 @@ def evaluate_arbitrage(prices: PricingDataset, strategy: ArbitrageStrategy,
             }
         else:
             # Discharging: we get paid for energy
+            # For discharge: The energy taken from storage (energy_out) is more than the energy delivered to the grid
+            # due to efficiency losses. So we need to divide by discharge_efficiency.
             energy_out = action.power_mw * duration_hours / discharge_efficiency
-            income = action.power_mw * sum(action_prices)
-            total_income += income
+            
+            # Calculate revenue based on exact time spent in each hour
+            revenue = 0
+            start_time = action.start_time
+            end_time = action.end_time
+            
+            # Iterate through each hour in the price series
+            for i, price in enumerate(action_prices):
+                hour_start = action_prices.index[i]
+                hour_end = hour_start + timedelta(hours=1)
+                
+                # Calculate overlap with this hour
+                overlap_start = max(start_time, hour_start)
+                overlap_end = min(end_time, hour_end)
+                
+                if overlap_end > overlap_start:
+                    # Calculate fraction of hour used
+                    fraction = (overlap_end - overlap_start).total_seconds() / 3600
+                    # Calculate revenue for this hour
+                    hour_revenue = action.power_mw * fraction * price
+                    revenue += hour_revenue
+            
+            total_revenue += revenue
             soc_mwh -= energy_out
             
             action_detail = {
@@ -104,7 +183,7 @@ def evaluate_arbitrage(prices: PricingDataset, strategy: ArbitrageStrategy,
                 "power_mw": action.power_mw,
                 "energy_mwh": energy_out,
                 "avg_price": action_prices.mean() if len(action_prices) > 0 else 0,
-                "income": income,
+                "revenue": revenue,
                 "soc_after": soc_mwh
             }
         
@@ -113,7 +192,10 @@ def evaluate_arbitrage(prices: PricingDataset, strategy: ArbitrageStrategy,
         action_details.append(action_detail)
     
     # Calculate net revenue
-    total_revenue = total_income - total_cost
+    total_profit = total_revenue - total_cost
+    
+    # If we've made it this far, the strategy is feasible
+    is_feasible = True
     
     # Convert SOC profile to Series
     if soc_profile:
@@ -123,46 +205,97 @@ def evaluate_arbitrage(prices: PricingDataset, strategy: ArbitrageStrategy,
         soc_series = pd.Series()
     
     return {
-        "total_revenue": total_revenue,
+        "total_profit": total_profit,
         "total_cost": total_cost,
-        "total_income": total_income,
+        "total_revenue": total_revenue,
         "is_feasible": is_feasible,
         "soc_profile": soc_series,
         "actions": action_details
     }
 
 
-def summarize_evaluation(evaluation_result: Dict) -> str:
+def summarize_evaluation(evaluation_result: Dict, verbose: bool = False) -> str:
     """
     Generate a human-readable summary of an arbitrage evaluation.
     
     Args:
         evaluation_result: Result from evaluate_arbitrage function
+        verbose: If True, include detailed information about each action
         
     Returns:
         Formatted string with evaluation summary
     """
     if not evaluation_result["is_feasible"]:
-        return "Strategy is not feasible with the given system constraints."
+        summary = ["Strategy is not feasible with the given system constraints."]
+        
+        # Include validation error details if available
+        if "validation_error" in evaluation_result and evaluation_result["validation_error"]:
+            error_info = evaluation_result["validation_error"]
+            summary.append(f"\nValidation Error: {error_info['error']}")
+            
+            if 'action' in error_info:
+                action = error_info['action']
+                summary.append(f"Problematic action: {'Charge' if action.is_charge else 'Discharge'} ")
+                summary.append(f"  From: {action.start_time}")
+                summary.append(f"  To: {action.end_time}")
+                summary.append(f"  Power: {action.power_mw} MW")
+                
+                duration_hours = (action.end_time - action.start_time).total_seconds() / 3600
+                summary.append(f"  Duration: {duration_hours:.2f} hours")
+            
+            if 'deficit' in error_info:
+                summary.append(f"Energy deficit: {error_info['deficit']:.2f} MWh")
+                summary.append(f"Current SOC: {error_info['current_soc']:.2f} MWh")
+                summary.append(f"Energy needed: {error_info['energy_needed']:.2f} MWh")
+            elif 'overflow' in error_info:
+                summary.append(f"Energy overflow: {error_info['overflow']:.2f} MWh")
+                summary.append(f"Current SOC: {error_info['current_soc']:.2f} MWh")
+                summary.append(f"Capacity: {error_info['capacity']:.2f} MWh")
+                summary.append(f"Energy to add: {error_info['energy_to_add']:.2f} MWh")
+        
+        return "\n".join(summary)
     
-    summary = ["Arbitrage Strategy Evaluation"]
+    summary = ["\nArbitrage Strategy Evaluation:"]
+    summary.append(f"Total Discharging Revenue: ${evaluation_result['total_revenue']:.2f}")
+    summary.append(f"- Total Charging Cost: ${evaluation_result['total_cost']:.2f}")
     summary.append("-" * 30)
-    summary.append(f"Total Revenue: ${evaluation_result['total_revenue']:.2f}")
-    summary.append(f"Total Cost: ${evaluation_result['total_cost']:.2f}")
-    summary.append(f"Total Income: ${evaluation_result['total_income']:.2f}")
+    summary.append(f"Total Arbitrage Profit: ${evaluation_result['total_profit']:.2f}")
     
-    # Summarize actions
+    # Count charge and discharge actions
     if evaluation_result["actions"]:
-        summary.append("\nActions:")
-        for i, action in enumerate(evaluation_result["actions"]):
-            if action["type"] == "charge":
-                summary.append(f"  {i+1}. CHARGE: {action['start_time']} to {action['end_time']}")
-                summary.append(f"     Power: {action['power_mw']:.2f} MW, Energy: {action['energy_mwh']:.2f} MWh")
-                summary.append(f"     Avg Price: ${action['avg_price']:.2f}, Cost: ${action['cost']:.2f}")
-            else:
-                summary.append(f"  {i+1}. DISCHARGE: {action['start_time']} to {action['end_time']}")
-                summary.append(f"     Power: {action['power_mw']:.2f} MW, Energy: {action['energy_mwh']:.2f} MWh")
-                summary.append(f"     Avg Price: ${action['avg_price']:.2f}, Income: ${action['income']:.2f}")
+        charge_actions = [a for a in evaluation_result["actions"] if a["type"] == "charge"]
+        discharge_actions = [a for a in evaluation_result["actions"] if a["type"] == "discharge"]
+        
+        total_charge_energy = sum(a["energy_mwh"] for a in charge_actions)
+        total_discharge_energy = sum(a["energy_mwh"] for a in discharge_actions)
+        
+        summary.append(f"\nTotal Actions: {len(evaluation_result['actions'])}")
+        summary.append(f"Charge Actions: {len(charge_actions)}")
+        summary.append(f"Discharge Actions: {len(discharge_actions)}")
+        summary.append(f"Total Energy Charged: {total_charge_energy:.2f} MWh")
+        summary.append(f"Total Energy Discharged: {total_discharge_energy:.2f} MWh")
+        
+        # Calculate average prices
+        avg_charge_price = sum(a["avg_price"] * a["energy_mwh"] for a in charge_actions) / total_charge_energy if total_charge_energy > 0 else 0
+        avg_discharge_price = sum(a["avg_price"] * a["energy_mwh"] for a in discharge_actions) / total_discharge_energy if total_discharge_energy > 0 else 0
+        price_spread = avg_discharge_price - avg_charge_price
+        
+        summary.append(f"Average Charge LMP: ${avg_charge_price:.2f}/MWh")
+        summary.append(f"Average Discharge LMP: ${avg_discharge_price:.2f}/MWh")
+        summary.append(f"Price Spread: ${price_spread:.2f}/MWh")
+        
+        # If verbose, show detailed actions
+        if verbose:
+            summary.append("\nDetailed Actions:")
+            for i, action in enumerate(evaluation_result["actions"]):
+                if action["type"] == "charge":
+                    summary.append(f"  {i+1}. CHARGE: {action['start_time']} to {action['end_time']}")
+                    summary.append(f"     Power: {action['power_mw']:.2f} MW, Energy: {action['energy_mwh']:.2f} MWh")
+                    summary.append(f"     Avg Price: ${action['avg_price']:.2f}, Cost: ${action['cost']:.2f}")
+                else:
+                    summary.append(f"  {i+1}. DISCHARGE: {action['start_time']} to {action['end_time']}")
+                    summary.append(f"     Power: {action['power_mw']:.2f} MW, Energy: {action['energy_mwh']:.2f} MWh")
+                    summary.append(f"     Avg Price: ${action['avg_price']:.2f}, Revenue: ${action['revenue']:.2f}")
     
     return "\n".join(summary)
 
@@ -180,6 +313,8 @@ def compare_strategies(prices: PricingDataset, strategies: Dict[str, ArbitrageSt
         max_discharge_mw: Maximum discharging power in MW
         storage_capacity_mwh: Storage capacity in MWh
         rte: Round-trip efficiency (0-1)
+        charge_efficiency: Charging efficiency (0-1)
+        discharge_efficiency: Discharging efficiency (0-1)
         
     Returns:
         DataFrame comparing strategy performance
@@ -187,22 +322,25 @@ def compare_strategies(prices: PricingDataset, strategies: Dict[str, ArbitrageSt
     results = []
     
     for name, strategy in strategies.items():
+        # Evaluate the strategy
         evaluation = evaluate_arbitrage(
             prices=prices,
             strategy=strategy,
             max_charge_mw=max_charge_mw,
             max_discharge_mw=max_discharge_mw,
             storage_capacity_mwh=storage_capacity_mwh,
-            rte=rte
+            rte=rte,
+            charge_efficiency=charge_efficiency,
+            discharge_efficiency=discharge_efficiency
         )
         
         results.append({
             "strategy": name,
-            "revenue": evaluation["total_revenue"],
+            "profit": evaluation["total_profit"],
             "cost": evaluation["total_cost"],
-            "income": evaluation["total_income"],
+            "revenue": evaluation["total_revenue"],
             "is_feasible": evaluation["is_feasible"],
             "num_actions": len(evaluation["actions"])
         })
     
-    return pd.DataFrame(results).sort_values(by="revenue", ascending=False)
+    return pd.DataFrame(results).sort_values(by="profit", ascending=False)
