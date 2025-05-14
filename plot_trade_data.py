@@ -32,9 +32,9 @@ def plot_cumulative_revenue(combined_df=None, output_dir="trade_data"):
         plt.plot(algo_data['datetime'], algo_data['cumulative_revenue'], 
                  label=algo, linewidth=2, marker='o', markersize=3)
     
-    plt.title('Cumulative Revenue Over Time', fontsize=16)
+    plt.title('Cumulative Arbitrage Profit', fontsize=16)
     plt.xlabel('Date', fontsize=14)
-    plt.ylabel('Cumulative Revenue ($M)', fontsize=14)
+    plt.ylabel('Arbitrage Profit ($M)', fontsize=14)
     plt.grid(True, alpha=0.3)
     plt.legend(fontsize=12)
     
@@ -81,9 +81,9 @@ def plot_daily_revenue(output_dir="trade_data"):
     plt.plot(dijkstra_daily['date'], dijkstra_ma, 
              label='Dijkstra 7-day MA', linewidth=2.5)
     
-    plt.title('Daily Revenue by Algorithm', fontsize=16)
+    plt.title('Daily Arbitrage Profit by Algorithm', fontsize=16)
     plt.xlabel('Date', fontsize=14)
-    plt.ylabel('Daily Revenue ($)', fontsize=14)
+    plt.ylabel('Daily Arbitrage Profit ($)', fontsize=14)
     plt.grid(True, alpha=0.3)
     plt.legend(fontsize=12)
     
@@ -127,9 +127,9 @@ def plot_monthly_revenue(output_dir="trade_data"):
     plt.figure(figsize=(14, 7))
     pivot_df.plot(kind='bar', width=0.8, figsize=(14, 7))
     
-    plt.title('Monthly Revenue by Algorithm', fontsize=16)
+    plt.title('Monthly Arbitrage Profit by Algorithm', fontsize=16)
     plt.xlabel('Month', fontsize=14)
-    plt.ylabel('Monthly Revenue ($)', fontsize=14)
+    plt.ylabel('Monthly Arbitrage Profit ($)', fontsize=14)
     plt.grid(True, axis='y', alpha=0.3)
     plt.legend(fontsize=12)
     
