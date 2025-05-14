@@ -220,10 +220,11 @@ def plot_trade_distribution(combined_df=None, output_dir="trade_data"):
                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
     
     plt.subplot(2, 1, 1)
-    for algo in charge_df['algorithm'].unique():
+    for i, algo in enumerate(charge_df['algorithm'].unique()):
         algo_data = charge_df[charge_df['algorithm'] == algo]
         month_counts = algo_data.groupby('month').size().reindex(month_order, fill_value=0)
-        plt.bar(range(len(month_counts)) + (0.2 if algo == 'Dijkstra' else -0.2), 
+        x_positions = [x + (0.2 if i == 1 else -0.2) for x in range(len(month_counts))]
+        plt.bar(x_positions, 
                 month_counts.values, width=0.4, alpha=0.7,
                 label=f'{algo} Charging')
     
@@ -235,10 +236,11 @@ def plot_trade_distribution(combined_df=None, output_dir="trade_data"):
     plt.xticks(range(len(month_names)), month_names)
     
     plt.subplot(2, 1, 2)
-    for algo in discharge_df['algorithm'].unique():
+    for i, algo in enumerate(discharge_df['algorithm'].unique()):
         algo_data = discharge_df[discharge_df['algorithm'] == algo]
         month_counts = algo_data.groupby('month').size().reindex(month_order, fill_value=0)
-        plt.bar(range(len(month_counts)) + (0.2 if algo == 'Dijkstra' else -0.2), 
+        x_positions = [x + (0.2 if i == 1 else -0.2) for x in range(len(month_counts))]
+        plt.bar(x_positions, 
                 month_counts.values, width=0.4, alpha=0.7,
                 label=f'{algo} Discharging')
     

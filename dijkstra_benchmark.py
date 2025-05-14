@@ -18,11 +18,13 @@ class DijkstraArbitrageAlgorithm(ArbitrageAlgorithm):
     def __init__(self,
                  window_hours: int = 48,
                  soc_bins: int = 50,
-                 time_step_hours: float = 1.0):
+                 time_step_hours: float = 1.0,
+                 allow_partial_actions: bool = True):
         self.window = window_hours
         self.bins = soc_bins
         self.dt = time_step_hours  # in hours
         self.safety_margin = 0.05  # 5% safety margin to avoid floating point issues
+        self.allow_partial_actions = allow_partial_actions
 
     def generate_strategy(self,
                           prices: PricingDataset,
@@ -151,13 +153,30 @@ class DijkstraArbitrageAlgorithm(ArbitrageAlgorithm):
                 if is_charge:
                     energy_in = power_mw * self.dt
                     energy_stored = energy_in * charge_efficiency
+                    original_power_mw = power_mw
                     
-                    # Strictly enforce capacity constraint (with safety margin)
+                    # Check if we would exceed capacity with full charge
                     if window_soc + energy_stored > effective_capacity:
-                        logging.info(f"Skipping charge action at {start_time}: SOC={window_soc:.2f}, would add {energy_stored:.2f} MWh")
-                        continue
-                        
-                    # Super-extra-additional safety check (belt-and-suspenders approach)
+                        if self.allow_partial_actions:
+                            # Calculate how much energy we can actually store
+                            available_capacity = effective_capacity - window_soc
+                            # Calculate adjusted power for partial charge
+                            adjusted_energy_in = available_capacity / charge_efficiency
+                            adjusted_power_mw = adjusted_energy_in / self.dt
+                            
+                            if adjusted_power_mw < 1.0:  # Too small to be worth it
+                                logging.info(f"Skipping charge action at {start_time}: SOC={window_soc:.2f}, remaining capacity too small")
+                                continue
+                                
+                            logging.info(f"Partial charge at {start_time}: SOC={window_soc:.2f}, reduced from {original_power_mw:.2f}MW to {adjusted_power_mw:.2f}MW")
+                            power_mw = adjusted_power_mw
+                            energy_in = adjusted_power_mw * self.dt
+                            energy_stored = energy_in * charge_efficiency
+                        else:
+                            logging.info(f"Skipping charge action at {start_time}: SOC={window_soc:.2f}, would add {energy_stored:.2f} MWh")
+                            continue
+                    
+                    # Final safety check for charge
                     next_soc = window_soc + energy_stored
                     if next_soc > effective_capacity:
                         logging.warning(f"Secondary safety check caught capacity violation: {next_soc:.2f} > {effective_capacity:.2f}")
@@ -167,13 +186,29 @@ class DijkstraArbitrageAlgorithm(ArbitrageAlgorithm):
                 else:  # discharge
                     energy_out = power_mw * self.dt  # energy delivered to grid
                     energy_removed = energy_out / discharge_efficiency  # energy from storage
+                    original_power_mw = power_mw
                     
-                    # Verify we have enough energy
+                    # Check if we have enough energy for full discharge
                     if window_soc < energy_removed:
-                        logging.info(f"Skipping discharge action at {start_time}: SOC={window_soc:.2f}, would need {energy_removed:.2f} MWh")
-                        continue
+                        if self.allow_partial_actions:
+                            # Calculate how much energy we can actually discharge
+                            available_energy = window_soc * discharge_efficiency
+                            # Calculate adjusted power for partial discharge
+                            adjusted_power_mw = available_energy / self.dt
+                            
+                            if adjusted_power_mw < 1.0:  # Too small to be worth it
+                                logging.info(f"Skipping discharge action at {start_time}: SOC={window_soc:.2f}, remaining energy too small")
+                                continue
+                                
+                            logging.info(f"Partial discharge at {start_time}: SOC={window_soc:.2f}, reduced from {original_power_mw:.2f}MW to {adjusted_power_mw:.2f}MW")
+                            power_mw = adjusted_power_mw
+                            energy_out = adjusted_power_mw * self.dt
+                            energy_removed = energy_out / discharge_efficiency
+                        else:
+                            logging.info(f"Skipping discharge action at {start_time}: SOC={window_soc:.2f}, would need {energy_removed:.2f} MWh")
+                            continue
                     
-                    # Additional safety check for discharge
+                    # Final safety check for discharge
                     next_soc = window_soc - energy_removed
                     if next_soc < 0:
                         logging.warning(f"Secondary safety check caught negative SOC: {next_soc:.2f}")
@@ -207,29 +242,70 @@ class DijkstraArbitrageAlgorithm(ArbitrageAlgorithm):
         
         for action in sorted_actions:
             duration_hours = (action.end_time - action.start_time).total_seconds() / 3600
+            original_power_mw = action.power_mw
+            adjusted_power_mw = original_power_mw
             
             if action.is_charge:
                 energy_in = action.power_mw * duration_hours
                 energy_stored = energy_in * charge_efficiency
                 
-                # Final check that this action won't exceed capacity
+                # Check if we would exceed capacity with full charge
                 if soc + energy_stored > storage_capacity_mwh * 0.999:  # Leave 0.1% buffer
-                    logging.warning(f"Pre-validation: Skipping charge at {action.start_time}: SOC={soc:.2f}, would add {energy_stored:.2f}")
-                    continue
+                    if self.allow_partial_actions:
+                        # Calculate how much energy we can actually store
+                        available_capacity = storage_capacity_mwh * 0.999 - soc
+                        # Calculate adjusted power for partial charge
+                        adjusted_energy_in = available_capacity / charge_efficiency
+                        adjusted_power_mw = adjusted_energy_in / duration_hours
+                        
+                        if adjusted_power_mw < 1.0:  # Too small to be worth it
+                            logging.warning(f"Pre-validation: Skipping charge at {action.start_time}: SOC={soc:.2f}, remaining capacity too small")
+                            continue
+                            
+                        logging.info(f"Pre-validation: Partial charge at {action.start_time}: SOC={soc:.2f}, reduced from {original_power_mw:.2f}MW to {adjusted_power_mw:.2f}MW")
+                        energy_in = adjusted_power_mw * duration_hours
+                        energy_stored = energy_in * charge_efficiency
+                    else:
+                        logging.warning(f"Pre-validation: Skipping charge at {action.start_time}: SOC={soc:.2f}, would add {energy_stored:.2f}")
+                        continue
                     
                 soc += energy_stored
-            else:
+            else:  # discharge
                 energy_out = action.power_mw * duration_hours  # energy delivered
                 energy_removed = energy_out / discharge_efficiency  # energy from storage
                 
-                # Final check that we have enough energy
+                # Check if we have enough energy for full discharge
                 if soc < energy_removed:
-                    logging.warning(f"Pre-validation: Skipping discharge at {action.start_time}: SOC={soc:.2f}, would need {energy_removed:.2f}")
-                    continue
+                    if self.allow_partial_actions:
+                        # Calculate how much energy we can actually discharge
+                        available_energy = soc * discharge_efficiency
+                        # Calculate adjusted power for partial discharge
+                        adjusted_power_mw = available_energy / duration_hours
+                        
+                        if adjusted_power_mw < 1.0:  # Too small to be worth it
+                            logging.warning(f"Pre-validation: Skipping discharge at {action.start_time}: SOC={soc:.2f}, remaining energy too small")
+                            continue
+                            
+                        logging.info(f"Pre-validation: Partial discharge at {action.start_time}: SOC={soc:.2f}, reduced from {original_power_mw:.2f}MW to {adjusted_power_mw:.2f}MW")
+                        energy_out = adjusted_power_mw * duration_hours
+                        energy_removed = energy_out / discharge_efficiency
+                    else:
+                        logging.warning(f"Pre-validation: Skipping discharge at {action.start_time}: SOC={soc:.2f}, would need {energy_removed:.2f}")
+                        continue
                     
                 soc -= energy_removed
                 
-            final_actions.append(action)
+            # Create a new action with potentially adjusted power
+            if adjusted_power_mw != original_power_mw:
+                new_action = ChargeDischargeAction(
+                    start_time=action.start_time,
+                    end_time=action.end_time,
+                    is_charge=action.is_charge,
+                    power_mw=adjusted_power_mw
+                )
+                final_actions.append(new_action)
+            else:
+                final_actions.append(action)
             
         logging.info(f"Strategy generation complete. Created {len(final_actions)} actions from original {len(actions)}")
         return ArbitrageStrategy(actions=final_actions)
@@ -258,7 +334,7 @@ if __name__ == "__main__":
     print(f"  Round-trip efficiency: {rte:.1%}")
     print(f"  Maximum theoretical cycle value: ${storage_capacity_mwh * discharge_efficiency * 10:.2f} (at $10/MWh spread)\n")
 
-    algo = DijkstraArbitrageAlgorithm(window_hours=48, soc_bins=50)
+    algo = DijkstraArbitrageAlgorithm(window_hours=48, soc_bins=50, allow_partial_actions=True)
     strategy = algo.generate_strategy(
         pricing,
         max_charge_mw=max_charge_mw,

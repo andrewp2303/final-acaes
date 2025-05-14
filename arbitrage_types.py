@@ -189,8 +189,10 @@ class ArbitrageStrategy:
                 # (or equivalently, multiply energy out by efficiency)
                 energy_out = action.power_mw * duration_hours / discharge_efficiency
                 
-                # Check if enough energy in storage
-                if soc_mwh < energy_out:
+                # Check if enough energy in storage with a small tolerance (0.5%)
+                # This allows for small floating-point precision issues
+                tolerance = 0.005 * energy_out  # 0.5% tolerance
+                if soc_mwh + tolerance < energy_out:
                     return {
                         'valid': False,
                         'error': 'Insufficient energy in storage for discharge',
