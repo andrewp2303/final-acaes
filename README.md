@@ -41,7 +41,7 @@ Implements a simple fixed-H approach where each day is divided into 24-hour bloc
 
 ### Dijkstra Benchmark Algorithm
 
-Implements a sliding-window Dijkstra-based arbitrage strategy with discretized state-of-charge levels. This approach is inspired by the GridWorks SCADA implementation (https://github.com/thegridelectric/gridworks-scada/blob/1b907584f66830d25f4210e89d4b0c0f2fe935d0/gw_spaceheat/actors/flo.py#L158).
+Implements a sliding-window Dijkstra-based arbitrage strategy with discretized state-of-charge levels. This approach is inspired by the GridWorks SCADA implementation (https://github.com/thegridelectric/gridworks-scada/blob/1b907584f66830d25f4210e89d4b0c0f2fe935d0/gw_spaceheat/actors/flo.py).
 
 ## How to Run
 
