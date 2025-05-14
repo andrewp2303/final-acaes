@@ -34,7 +34,7 @@ def plot_cumulative_revenue(combined_df=None, output_dir="trade_data"):
     
     plt.title('Cumulative Revenue Over Time', fontsize=16)
     plt.xlabel('Date', fontsize=14)
-    plt.ylabel('Cumulative Revenue ($)', fontsize=14)
+    plt.ylabel('Cumulative Revenue ($M)', fontsize=14)
     plt.grid(True, alpha=0.3)
     plt.legend(fontsize=12)
     
